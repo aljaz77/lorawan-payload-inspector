@@ -91,7 +91,18 @@ class SensorDataConverter:
     def __init__(self, root):
         self.root = root
         self.root.title("Network Payload to Spreadsheet Converter")
-        self.root.geometry("700x900")
+
+        # Size the window to fit whatever screen it's running on (e.g. a
+        # smaller HD laptop display) instead of a fixed size that can end up
+        # taller than the screen. The whole window is also wrapped in a
+        # scrollable canvas below, so even if it doesn't fully fit, everything
+        # remains reachable by scrolling.
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(700, max(480, screen_w - 60))
+        win_h = min(900, max(400, screen_h - 100))
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(420, 320)
 
         # ---- data state ----
         self.data = []            # every parsed row (dict), includes "_dt" datetime or None
@@ -105,8 +116,41 @@ class SensorDataConverter:
 
         self.output_datetime_format_var = tk.StringVar(value=DEFAULT_DATETIME_FORMAT)
 
+        # ================= Outer scrollable canvas =================
+        # Everything below lives inside this canvas/frame instead of directly
+        # in `root`, so the whole window's content can be scrolled vertically
+        # (and horizontally if very narrow) no matter the screen resolution.
+        outer_container = tk.Frame(root)
+        outer_container.pack(fill=tk.BOTH, expand=True)
+
+        self.outer_canvas = tk.Canvas(outer_container, highlightthickness=0)
+        outer_v_scroll = tk.Scrollbar(outer_container, orient="vertical", command=self.outer_canvas.yview)
+        outer_h_scroll = tk.Scrollbar(outer_container, orient="horizontal", command=self.outer_canvas.xview)
+        self.content_frame = tk.Frame(self.outer_canvas)
+
+        self.content_frame.bind(
+            "<Configure>",
+            lambda e: self.outer_canvas.configure(scrollregion=self.outer_canvas.bbox("all"))
+        )
+        self._content_window = self.outer_canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+
+        def _sync_content_width(event):
+            # Keep the inner frame at least as wide as the canvas so widgets
+            # lay out normally; if the window is too narrow the horizontal
+            # scrollbar takes over instead of squashing everything.
+            self.outer_canvas.itemconfig(self._content_window, width=max(event.width, self.content_frame.winfo_reqwidth()))
+
+        self.outer_canvas.bind("<Configure>", _sync_content_width)
+        self.outer_canvas.configure(yscrollcommand=outer_v_scroll.set, xscrollcommand=outer_h_scroll.set)
+
+        outer_v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        outer_h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        root_content = self.content_frame
+
         # ================= Top: load file =================
-        top = tk.Frame(root, padx=15, pady=10)
+        top = tk.Frame(root_content, padx=15, pady=10)
         top.pack(fill=tk.X)
 
         tk.Label(top, text="Step 1: Load log file (.txt, .json, .jsonl)", font=("Arial", 10, "bold")).pack(anchor="w")
@@ -118,7 +162,7 @@ class SensorDataConverter:
         self.file_label.pack(side=tk.LEFT, padx=10)
 
         # ================= Filter bar (time range + downsample) =================
-        filt = tk.LabelFrame(root, text="Step 2: Filter & reduce data", padx=15, pady=10)
+        filt = tk.LabelFrame(root_content, text="Step 2: Filter & reduce data", padx=15, pady=10)
         filt.pack(fill=tk.X, padx=15, pady=(0, 10))
 
         tk.Label(filt, text="From:").grid(row=0, column=0, sticky="w")
@@ -155,8 +199,10 @@ class SensorDataConverter:
         self.filter_status.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         # ================= Tabs: Table export / Graph export =================
-        self.notebook = ttk.Notebook(root)
+        self.notebook = ttk.Notebook(root_content)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+
+
 
         self.table_tab = tk.Frame(self.notebook)
         self.graph_tab = tk.Frame(self.notebook)
@@ -165,6 +211,14 @@ class SensorDataConverter:
 
         self._build_table_tab()
         self._build_graph_tab()
+
+        # One global mousewheel handler for the whole app: it figures out
+        # which scrollable canvas is under the cursor (one of the inner
+        # column lists, the stats panel, or the outer window canvas) and
+        # scrolls that one. Works regardless of window/screen size.
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
 
     # ======================================================================
     # Loading
@@ -329,29 +383,31 @@ class SensorDataConverter:
             self._color_swatches = getattr(self, "_color_swatches", {})
             self._color_swatches[var] = swatch
 
-    def _bind_mousewheel(self, canvas):
-        """Let the mouse wheel scroll this canvas while the cursor is over it
-        (Windows/Mac use <MouseWheel>, Linux uses Button-4/5)."""
-        def _on_mousewheel(event):
-            if event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    def _on_mousewheel(self, event):
+        """Route a mousewheel/scroll event to whichever scrollable canvas the
+        cursor is currently over (an inner column list, the stats panel, or
+        the outer window canvas as a fallback), so scrolling always works no
+        matter where the mouse is or how big the window/screen is."""
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        target = self.outer_canvas
+        inner_canvases = (
+            getattr(self, "table_check_canvas", None),
+            getattr(self, "graph_check_canvas", None),
+            getattr(self, "stats_canvas", None),
+        )
+        w = widget
+        while w is not None:
+            if w in inner_canvases:
+                target = w
+                break
+            w = w.master if hasattr(w, "master") else None
 
-        def _bind_all(_event=None):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            canvas.bind_all("<Button-4>", _on_mousewheel)
-            canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        def _unbind_all(_event=None):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-
-        canvas.bind("<Enter>", _bind_all)
-        canvas.bind("<Leave>", _unbind_all)
+        if event.num == 4:
+            target.yview_scroll(-1, "units")
+        elif event.num == 5:
+            target.yview_scroll(1, "units")
+        else:
+            target.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _choose_color(self, var):
         current = self.graph_colors[var].get()
@@ -416,6 +472,7 @@ class SensorDataConverter:
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         canvas = tk.Canvas(container, highlightthickness=0)
+        self.table_check_canvas = canvas
         scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
         self.table_check_frame = tk.Frame(canvas)
 
@@ -424,7 +481,6 @@ class SensorDataConverter:
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._bind_mousewheel(canvas)
 
         self.export_btn = tk.Button(self.table_tab, text="Export to CSV", command=self.export_file,
                                      width=20, bg="#4CAF50", fg="white")
@@ -480,6 +536,7 @@ class SensorDataConverter:
         container.pack_propagate(False)
 
         canvas = tk.Canvas(container, highlightthickness=0)
+        self.graph_check_canvas = canvas
         scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
         self.graph_check_frame = tk.Frame(canvas)
 
@@ -488,7 +545,6 @@ class SensorDataConverter:
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._bind_mousewheel(canvas)
 
         opts = tk.LabelFrame(self.graph_tab, text="Chart text & layout", padx=10, pady=8)
         opts.pack(fill=tk.X, padx=10, pady=5)
@@ -567,6 +623,7 @@ class SensorDataConverter:
         stats_container.pack(fill=tk.BOTH, expand=True)
 
         stats_canvas = tk.Canvas(stats_container, highlightthickness=0)
+        self.stats_canvas = stats_canvas
         stats_scroll = tk.Scrollbar(stats_container, orient="vertical", command=stats_canvas.yview)
         self.stats_frame = tk.Frame(stats_canvas)
 
@@ -575,7 +632,6 @@ class SensorDataConverter:
         stats_canvas.configure(yscrollcommand=stats_scroll.set)
         stats_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         stats_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._bind_mousewheel(stats_canvas)
 
         self._preview_windows = []
 
