@@ -10,6 +10,7 @@ try:
     matplotlib.use("TkAgg")
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import matplotlib.dates as mdates
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
@@ -61,6 +62,21 @@ UNIT_RULES = [
 CHART_COLOR_PALETTE = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
                         "#17becf", "#e377c2", "#8c564b", "#bcbd22", "#7f7f7f"]
 
+# Output date/time format presets: label -> (date_strftime, time_strftime).
+# Used for CSV Date/Time columns, chart x-axis ticks, and the min/max/avg
+# readout timestamps. The first entry is the original/default behavior.
+DATETIME_FORMATS = {
+    "Default (YYYY-MM-DD, 24h)": ("%Y-%m-%d", "%H:%M:%S"),
+    "YYYY/MM/DD, 24h": ("%Y/%m/%d", "%H:%M:%S"),
+    "DD/MM/YYYY, 24h": ("%d/%m/%Y", "%H:%M:%S"),
+    "MM/DD/YYYY, 24h": ("%m/%d/%Y", "%H:%M:%S"),
+    "DD-MM-YYYY, 24h": ("%d-%m-%Y", "%H:%M:%S"),
+    "DD.MM.YYYY, 24h": ("%d.%m.%Y", "%H:%M:%S"),
+    "MM/DD/YYYY, 12h (AM/PM)": ("%m/%d/%Y", "%I:%M:%S %p"),
+    "DD/MM/YYYY, 12h (AM/PM)": ("%d/%m/%Y", "%I:%M:%S %p"),
+}
+DEFAULT_DATETIME_FORMAT = "Default (YYYY-MM-DD, 24h)"
+
 
 def auto_unit(var_name):
     normalized = var_name.lower().replace("_", "").replace("-", "").replace(" ", "")
@@ -75,7 +91,7 @@ class SensorDataConverter:
     def __init__(self, root):
         self.root = root
         self.root.title("Network Payload to Spreadsheet Converter")
-        self.root.geometry("680x820")
+        self.root.geometry("700x900")
 
         # ---- data state ----
         self.data = []            # every parsed row (dict), includes "_dt" datetime or None
@@ -85,6 +101,9 @@ class SensorDataConverter:
         self.graph_vars = {}      # var name -> BooleanVar (graph column selection)
         self.graph_units = {}     # var name -> StringVar (unit label for that column)
         self.graph_colors = {}    # var name -> StringVar (hex color for that column's line)
+        self.graph_labels = {}    # var name -> StringVar (display name/rename for that column)
+
+        self.output_datetime_format_var = tk.StringVar(value=DEFAULT_DATETIME_FORMAT)
 
         # ================= Top: load file =================
         top = tk.Frame(root, padx=15, pady=10)
@@ -126,8 +145,14 @@ class SensorDataConverter:
         self.apply_btn = tk.Button(filt, text="Apply Filters", command=self.apply_filters, state=tk.DISABLED)
         self.apply_btn.grid(row=2, column=4, columnspan=2, sticky="e", pady=(8, 0))
 
+        tk.Label(filt, text="Output date/time format (CSV, graph, stats):").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        datetime_menu = tk.OptionMenu(filt, self.output_datetime_format_var, *DATETIME_FORMATS.keys())
+        datetime_menu.config(width=24)
+        datetime_menu.grid(row=4, column=3, columnspan=3, sticky="w", pady=(8, 0))
+
         self.filter_status = tk.Label(filt, text="No data loaded yet.", fg="gray")
-        self.filter_status.grid(row=3, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self.filter_status.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         # ================= Tabs: Table export / Graph export =================
         self.notebook = ttk.Notebook(root)
@@ -278,17 +303,23 @@ class SensorDataConverter:
         self.graph_vars.clear()
         self.graph_units.clear()
         self.graph_colors.clear()
+        self.graph_labels.clear()
         for i, var in enumerate(self.variables):
             v = tk.BooleanVar(value=False)
             u = tk.StringVar(value=auto_unit(var))
             c = tk.StringVar(value=CHART_COLOR_PALETTE[i % len(CHART_COLOR_PALETTE)])
+            lbl = tk.StringVar(value=var)
             self.graph_vars[var] = v
             self.graph_units[var] = u
             self.graph_colors[var] = c
+            self.graph_labels[var] = lbl
 
             r = tk.Frame(self.graph_check_frame)
             r.pack(fill=tk.X, padx=5, pady=1)
-            tk.Checkbutton(r, text=var, variable=v, font=("Arial", 10), width=20, anchor="w").pack(side=tk.LEFT)
+            tk.Checkbutton(r, variable=v, width=2, anchor="w").pack(side=tk.LEFT)
+            tk.Label(r, text=var, fg="gray", width=16, anchor="w", font=("Arial", 9)).pack(side=tk.LEFT)
+            tk.Label(r, text="label:", fg="gray").pack(side=tk.LEFT, padx=(5, 2))
+            tk.Entry(r, textvariable=lbl, width=14).pack(side=tk.LEFT)
             tk.Label(r, text="unit:", fg="gray").pack(side=tk.LEFT, padx=(5, 2))
             tk.Entry(r, textvariable=u, width=8).pack(side=tk.LEFT)
 
@@ -420,7 +451,14 @@ class SensorDataConverter:
                 writer = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore', delimiter=';')
                 writer.writeheader()
                 for row in self.filtered_data:
-                    writer.writerow(row)
+                    if row.get("_dt") is not None:
+                        date_str, time_str = self._format_dt(row["_dt"])
+                        out_row = dict(row)
+                        out_row["Date"] = date_str
+                        out_row["Time"] = time_str
+                    else:
+                        out_row = row
+                    writer.writerow(out_row)
             messagebox.showinfo("Success", "Data exported!\n\nOpen this in LibreOffice. It should now split into columns automatically.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save the file:\n{e}")
@@ -464,26 +502,52 @@ class SensorDataConverter:
         self.graph_note_entry = tk.Entry(opts, width=45)
         self.graph_note_entry.grid(row=1, column=1, padx=5, pady=3, sticky="w")
 
+        tk.Label(opts, text="X-axis label:").grid(row=2, column=0, sticky="w")
+        self.xaxis_label_entry = tk.Entry(opts, width=45)
+        self.xaxis_label_entry.insert(0, "Time")
+        self.xaxis_label_entry.grid(row=2, column=1, padx=5, pady=3, sticky="w")
+
+        tk.Label(opts, text="Shared Y-axis label (used when columns share one axis):").grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        self.yaxis_label_entry = tk.Entry(opts, width=45)
+        self.yaxis_label_entry.insert(0, "Value")
+        self.yaxis_label_entry.grid(row=4, column=1, padx=5, pady=3, sticky="w")
+
         self.separate_axes_var = tk.BooleanVar(value=True)
         tk.Checkbutton(opts, text="Give each selected column its own y-axis (combined chart)",
-                        variable=self.separate_axes_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+                        variable=self.separate_axes_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         self.separate_files_var = tk.BooleanVar(value=False)
         tk.Checkbutton(opts, text="Export each selected column as its own separate graph/file",
-                        variable=self.separate_files_var).grid(row=3, column=0, columnspan=2, sticky="w")
+                        variable=self.separate_files_var).grid(row=6, column=0, columnspan=2, sticky="w")
 
-        tk.Label(opts, text="Image format:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.show_markers_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opts, text="Show markers (dots) on lines - uncheck for line only",
+                        variable=self.show_markers_var).grid(row=7, column=0, columnspan=2, sticky="w")
+
+        tk.Label(opts, text="Image format:").grid(row=8, column=0, sticky="w", pady=(8, 0))
         self.image_format_var = tk.StringVar(value="PNG")
         format_menu = tk.OptionMenu(opts, self.image_format_var, "PNG", "JPG", "SVG", "PDF")
         format_menu.config(width=8)
-        format_menu.grid(row=4, column=1, sticky="w", pady=(8, 0))
+        format_menu.grid(row=8, column=1, sticky="w", pady=(8, 0))
 
-        tk.Label(opts, text="Resolution (DPI):").grid(row=5, column=0, sticky="w")
+        tk.Label(opts, text="Resolution (DPI):").grid(row=9, column=0, sticky="w")
         self.dpi_entry = tk.Entry(opts, width=10)
         self.dpi_entry.insert(0, "150")
-        self.dpi_entry.grid(row=5, column=1, sticky="w")
-        tk.Label(opts, text="(image sharpness - higher = larger file, ignored for SVG/PDF)",
-                 fg="gray", font=("Arial", 8)).grid(row=6, column=0, columnspan=2, sticky="w")
+        self.dpi_entry.grid(row=9, column=1, sticky="w")
+
+        tk.Label(opts, text="Custom size - Width x Height (px):").grid(row=10, column=0, sticky="w")
+        size_row = tk.Frame(opts)
+        size_row.grid(row=10, column=1, sticky="w")
+        self.width_entry = tk.Entry(size_row, width=8)
+        self.width_entry.insert(0, "1125")
+        self.width_entry.pack(side=tk.LEFT)
+        tk.Label(size_row, text=" x ").pack(side=tk.LEFT)
+        self.height_entry = tk.Entry(size_row, width=8)
+        self.height_entry.insert(0, "675")
+        self.height_entry.pack(side=tk.LEFT)
+        tk.Label(opts, text="(sets the actual pixel dimensions of preview/export; DPI still controls sharpness)",
+                 fg="gray", font=("Arial", 8)).grid(row=11, column=0, columnspan=2, sticky="w")
 
         btns = tk.Frame(self.graph_tab)
         btns.pack(pady=8)
@@ -529,6 +593,14 @@ class SensorDataConverter:
                 values.append(val)
         return times, values
 
+    def _format_dt(self, dt):
+        """Format a datetime according to the currently selected output
+        date/time format. Returns (date_str, time_str)."""
+        if dt is None:
+            return "", ""
+        date_fmt, time_fmt = DATETIME_FORMATS[self.output_datetime_format_var.get()]
+        return dt.strftime(date_fmt), dt.strftime(time_fmt)
+
     def _copy_to_clipboard(self, text):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
@@ -547,11 +619,15 @@ class SensorDataConverter:
         for widget in self.stats_frame.winfo_children():
             widget.destroy()
 
+        date_fmt, time_fmt = DATETIME_FORMATS[self.output_datetime_format_var.get()]
+        combined_fmt = f"{date_fmt} {time_fmt}"
+
         for var in selected_vars:
             times, values = self._numeric_series(var)
             unit = self.graph_units[var].get().strip()
+            name = self._display_label(var)
 
-            tk.Label(self.stats_frame, text=var, font=("Consolas", 9, "bold"), anchor="w").pack(
+            tk.Label(self.stats_frame, text=name, font=("Consolas", 9, "bold"), anchor="w").pack(
                 fill=tk.X, anchor="w", pady=(6, 0))
 
             if not values:
@@ -562,33 +638,49 @@ class SensorDataConverter:
             max_idx = values.index(max(values))
             vmin, vmax = values[min_idx], values[max_idx]
             vavg = sum(values) / len(values)
-            min_time = times[min_idx].strftime("%Y/%m/%d %H:%M:%S")
-            max_time = times[max_idx].strftime("%Y/%m/%d %H:%M:%S")
+            min_time = times[min_idx].strftime(combined_fmt)
+            max_time = times[max_idx].strftime(combined_fmt)
             unit_suffix = f" {unit}" if unit else ""
 
             self._add_stat_row(self.stats_frame, f"   min: {vmin:.3f}{unit_suffix}   at {min_time}", vmin, unit)
             self._add_stat_row(self.stats_frame, f"   avg: {vavg:.3f}{unit_suffix}", vavg, unit)
             self._add_stat_row(self.stats_frame, f"   max: {vmax:.3f}{unit_suffix}   at {max_time}", vmax, unit)
 
-    def _build_combined_figure(self, selected_vars, dpi):
+    def _display_label(self, var):
+        """Return the user-editable display name for a column, falling back
+        to the raw variable name if left blank."""
+        return self.graph_labels[var].get().strip() or var
+
+    def _marker_kwargs(self):
+        if self.show_markers_var.get():
+            return {"marker": "o", "markersize": 3}
+        return {"marker": "", "markersize": 0}
+
+    def _apply_date_formatter(self, ax):
+        date_fmt, _time_fmt = DATETIME_FORMATS[self.output_datetime_format_var.get()]
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
+
+    def _build_combined_figure(self, selected_vars, dpi, figsize):
         rows = [r for r in self.filtered_data if r.get("_dt") is not None]
         if not rows:
             messagebox.showwarning("Warning", "No timestamped rows available to plot.")
             return None
 
-        fig = Figure(figsize=(7.5, 4.5), dpi=dpi)
+        fig = Figure(figsize=figsize, dpi=dpi)
         ax_main = fig.add_subplot(111)
 
         lines, labels = [], []
         separate = self.separate_axes_var.get() and len(selected_vars) > 1
+        marker_kwargs = self._marker_kwargs()
 
         for i, var in enumerate(selected_vars):
             xs, ys = self._numeric_series(var, rows)
             if not xs:
                 continue
 
+            name = self._display_label(var)
             unit = self.graph_units[var].get().strip()
-            axis_label = f"{var} ({unit})" if unit else var
+            axis_label = f"{name} ({unit})" if unit else name
             color = self.graph_colors[var].get()
 
             if i == 0:
@@ -600,7 +692,7 @@ class SensorDataConverter:
             else:
                 ax = ax_main
 
-            line, = ax.plot(xs, ys, label=axis_label, color=color, marker="o", markersize=3, linewidth=1.2)
+            line, = ax.plot(xs, ys, label=axis_label, color=color, linewidth=1.2, **marker_kwargs)
             lines.append(line)
             labels.append(axis_label)
 
@@ -608,9 +700,10 @@ class SensorDataConverter:
                 ax.set_ylabel(axis_label, color=color)
                 ax.tick_params(axis="y", labelcolor=color)
             elif i == 0:
-                ax.set_ylabel("Value")
+                ax.set_ylabel(self.yaxis_label_entry.get().strip() or "Value")
 
-        ax_main.set_xlabel("Time")
+        ax_main.set_xlabel(self.xaxis_label_entry.get().strip() or "Time")
+        self._apply_date_formatter(ax_main)
         title = self.graph_title_entry.get().strip()
         if title:
             ax_main.set_title(title)
@@ -625,24 +718,27 @@ class SensorDataConverter:
         fig.tight_layout(rect=[0, 0.03, 1, 1])
         return fig
 
-    def _build_single_column_figure(self, var, dpi):
+    def _build_single_column_figure(self, var, dpi, figsize):
         xs, ys = self._numeric_series(var)
         if not xs:
             return None
 
+        name = self._display_label(var)
         unit = self.graph_units[var].get().strip()
-        axis_label = f"{var} ({unit})" if unit else var
+        axis_label = f"{name} ({unit})" if unit else name
         color = self.graph_colors[var].get()
+        marker_kwargs = self._marker_kwargs()
 
-        fig = Figure(figsize=(7.5, 4.5), dpi=dpi)
+        fig = Figure(figsize=figsize, dpi=dpi)
         ax = fig.add_subplot(111)
-        ax.plot(xs, ys, label=axis_label, color=color, marker="o", markersize=3, linewidth=1.2)
-        ax.set_xlabel("Time")
+        ax.plot(xs, ys, label=axis_label, color=color, linewidth=1.2, **marker_kwargs)
+        ax.set_xlabel(self.xaxis_label_entry.get().strip() or "Time")
         ax.set_ylabel(axis_label, color=color)
         ax.tick_params(axis="y", labelcolor=color)
+        self._apply_date_formatter(ax)
 
         base_title = self.graph_title_entry.get().strip()
-        ax.set_title(f"{base_title} - {var}" if base_title else var)
+        ax.set_title(f"{base_title} - {name}" if base_title else name)
 
         note = self.graph_note_entry.get().strip()
         if note:
@@ -651,6 +747,29 @@ class SensorDataConverter:
         fig.autofmt_xdate()
         fig.tight_layout(rect=[0, 0.03, 1, 1])
         return fig
+
+    def _get_dpi_and_figsize(self):
+        """Parse the DPI and Width/Height (px) fields. Returns (dpi, figsize)
+        or None (after showing an error) if something is invalid."""
+        try:
+            dpi = int(self.dpi_entry.get().strip() or "150")
+            if dpi <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Resolution (DPI) must be a positive whole number.")
+            return None
+
+        try:
+            width_px = int(self.width_entry.get().strip() or "1125")
+            height_px = int(self.height_entry.get().strip() or "675")
+            if width_px <= 0 or height_px <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Width/Height must be positive whole numbers (pixels).")
+            return None
+
+        figsize = (width_px / dpi, height_px / dpi)
+        return dpi, figsize
 
     def _close_preview_windows(self):
         for win in self._preview_windows:
@@ -677,26 +796,25 @@ class SensorDataConverter:
             messagebox.showwarning("Warning", "No data to plot. Load a file and apply filters first.")
             return
 
-        try:
-            dpi = int(self.dpi_entry.get().strip() or "150")
-        except ValueError:
-            messagebox.showerror("Error", "Resolution (DPI) must be a whole number.")
+        parsed = self._get_dpi_and_figsize()
+        if parsed is None:
             return
+        dpi, figsize = parsed
 
         self._close_preview_windows()
 
         if self.separate_files_var.get():
             skipped = []
             for var in selected_vars:
-                fig = self._build_single_column_figure(var, dpi)
+                fig = self._build_single_column_figure(var, dpi, figsize)
                 if fig is None:
                     skipped.append(var)
                     continue
-                self._show_figure_window(fig, title=var)
+                self._show_figure_window(fig, title=self._display_label(var))
             if skipped and len(skipped) == len(selected_vars):
                 messagebox.showwarning("Warning", "No numeric data to plot for the selected column(s).")
         else:
-            fig = self._build_combined_figure(selected_vars, dpi)
+            fig = self._build_combined_figure(selected_vars, dpi, figsize)
             if fig is None:
                 return
             self._show_figure_window(fig, title=self.graph_title_entry.get().strip() or "Graph Preview")
@@ -718,11 +836,10 @@ class SensorDataConverter:
             "pdf": ("PDF Document", "*.pdf"),
         }
 
-        try:
-            dpi = int(self.dpi_entry.get().strip() or "150")
-        except ValueError:
-            messagebox.showerror("Error", "Resolution (DPI) must be a whole number.")
+        parsed = self._get_dpi_and_figsize()
+        if parsed is None:
             return
+        dpi, figsize = parsed
 
         if self.separate_files_var.get():
             folder = filedialog.askdirectory(title="Choose folder to save the graphs into")
@@ -731,11 +848,11 @@ class SensorDataConverter:
 
             saved, skipped = [], []
             for var in selected_vars:
-                fig = self._build_single_column_figure(var, dpi)
+                fig = self._build_single_column_figure(var, dpi, figsize)
                 if fig is None:
                     skipped.append(var)
                     continue
-                safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in var)
+                safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self._display_label(var))
                 out_path = os.path.join(folder, f"{safe_name}{ext}")
                 fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
                 saved.append(out_path)
@@ -747,7 +864,7 @@ class SensorDataConverter:
                 msg += f"\n\nSkipped (no numeric data): {', '.join(skipped)}"
             messagebox.showinfo("Success", msg)
         else:
-            fig = self._build_combined_figure(selected_vars, dpi)
+            fig = self._build_combined_figure(selected_vars, dpi, figsize)
             if fig is None:
                 return
             filepath = filedialog.asksaveasfilename(defaultextension=ext, filetypes=[filetype_labels[fmt]])
